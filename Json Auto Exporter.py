@@ -223,11 +223,18 @@ def extract_table(sheet_name, xls, uploaded_file, info, generated_on, table_name
             try:
                 bom_df = st.session_state.get("bom_report_level1")
                 device_kw = str(extra_fields["Device"]).strip() if extra_fields and "Device" in extra_fields else ""
-                subrole_kw = subrole_header
+                subrole_kw = subrole_header.strip().lower() if subrole_header else ""
                 if bom_df is not None and device_kw:
                     for idx, row in bom_df.iterrows():
                         desc = str(row.get("Part Description", "")).lower()
-                        if device_kw.lower() in desc and (not subrole_kw or subrole_kw.lower() in desc):
+                        match_device = device_kw.lower() in desc
+                        match_subrole = True
+                        if subrole_kw:
+                            if "utility" in subrole_kw:
+                                match_subrole = "utility" in desc
+                            else:
+                                match_subrole = (subrole_kw in desc) and ("utility" not in desc)
+                        if match_device and match_subrole:
                             child_part_number = str(row.get("Part Number", ""))
                             break
             except Exception:
@@ -265,11 +272,20 @@ def extract_table(sheet_name, xls, uploaded_file, info, generated_on, table_name
         return None, str(e)
 
 def extract_device_child_parent(sheet_name, xls, uploaded_file, info):
-    # Device: B2
+    # 遍历sheet所有单元格，模糊查找包含'device'的单元格，取右侧的值
     device_val = ""
     try:
         raw = pd.read_excel(uploaded_file, sheet_name=sheet_name, header=None, dtype=str)
-        device_val = str(raw.iloc[1,1]).strip()
+        found = False
+        for i in range(raw.shape[0]):
+            for j in range(raw.shape[1] - 1):
+                cell = str(raw.iloc[i, j]).strip().lower()
+                if "device" in cell:
+                    device_val = str(raw.iloc[i, j + 1]).strip()
+                    found = True
+                    break
+            if found:
+                break
     except Exception:
         device_val = ""
     parent_part_number = info.get("Item Number", "")
