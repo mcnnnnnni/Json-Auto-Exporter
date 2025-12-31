@@ -2,11 +2,8 @@ import streamlit as st
 import pandas as pd
 import json
 import datetime
-import re
 import io
 
-
-# 页面更宽
 
 # Set page config: left-aligned, wide, English
 st.set_page_config(page_title="JSON Auto Exporter", layout="wide")
@@ -105,11 +102,11 @@ st.markdown("""
     </style>
 """, unsafe_allow_html=True)
 
+
 st.title("📝 JSON Auto Exporter")
 
-# ====== 上传区美化 ======
-
-# Upload section (English, left-aligned)
+#===Upload section===
+# Step 1: Upload
 st.markdown("""
 <div class='card-section'>
     <div class='step-title'><span class='step-num'>1</span>📤 Upload Excel File</div>
@@ -119,8 +116,7 @@ st.markdown("""
 
 uploaded_file = st.file_uploader("Excel File", type=["xlsx", "xls"], key="uploaded_file")
 
-# Start按钮右下角
-import streamlit.components.v1 as components
+# Step 2: Start
 if uploaded_file:
     # 重新渲染文件名和Start按钮在一行
     file_display_col, start_btn_col = st.columns([8,1], gap="small")
@@ -134,7 +130,6 @@ else:
 
 st.markdown("</div>", unsafe_allow_html=True)
 
-
 start_processing = False
 if uploaded_file:
     if start_clicked:
@@ -147,8 +142,17 @@ if not uploaded_file or not st.session_state.get("start_processing", False):
     st.stop()
 
 
-
+#===Functions===
+#1. 提取ERASSY中的关键表名
+def get_sheet_by_keyword(xls, keyword):
+    # 返回第一个包含keyword（不区分大小写）的sheet名
+    for name in xls.sheet_names:
+        if keyword.lower() in name.lower():
+            return name
+    return None
+#2. 提取Part Properties和BOM report的关键信息
 def get_info_fields(df, info_fields):
+    #用于读取Part Properties信息，后面需要用于表头
     info = {}
     for i in range(min(30, len(df))):
         key = str(df.iloc[i,0]).strip()
@@ -156,9 +160,9 @@ def get_info_fields(df, info_fields):
         if key in info_fields:
             info[key] = val
     return info
-
+#3. 获取生成JSON的时间
 def get_generated_on(xls=None, uploaded_file=None):
-    # 统一返回当前时刻，格式为m/d/Y h:M:S AM/PM（兼容Windows，去掉-）
+    # 统一返回当前的时间，格式为m/d/Y h:M:S AM/PM
     now = datetime.datetime.now()
     # %I 是12小时制，去除前导零
     hour = str(int(now.strftime("%I")))
@@ -168,18 +172,21 @@ def get_generated_on(xls=None, uploaded_file=None):
     formatted = formatted.replace("/0", "/")
     return formatted
 
+#4. JSON的表头模板和具体的内容获取
 def extract_table(sheet_name, xls, uploaded_file, info, generated_on, table_name, filename, extra_fields=None):
     try:
         raw = pd.read_excel(uploaded_file, sheet_name=sheet_name, header=None, dtype=str)
         header_row_idx = None
-        # 只找 row nbr
+        # 找到表头行，"row nbr" or "row number"
         for i in range(len(raw)):
             cell_val = str(raw.iloc[i,0]).strip().lower()
-            if cell_val == "row nbr":
+            if cell_val in ["row nbr", "row number"]:
                 header_row_idx = i
                 break
         if header_row_idx is None:
-            return None, f"Suspected sheet but no matching table found (missing 'row nbr'): {sheet_name}"
+            return None, f"Suspected sheet but no matching table content found: {sheet_name}"
+        
+        # 处理Exel，只提取有信息的表格内容
         header_row = raw.iloc[header_row_idx]
         valid_cols = []
         for idx, col in enumerate(header_row):
@@ -194,51 +201,45 @@ def extract_table(sheet_name, xls, uploaded_file, info, generated_on, table_name
         df = df.dropna(how='all').fillna("").astype(str)
 
         # 检查主字段缺失并收集warning
-        # 提取Version字段（所有类型都支持）
+        # 提取Version字段，在前10行中搜索是否有单元格含有version字样，如果有提取右边单元格的值作为version值.
         version_val = "1"
-        for i in range(min(30, len(raw))):
+        for i in range(min(10, len(raw))):
             for j in range(raw.shape[1]-1):
                 cell = str(raw.iloc[i, j]).strip().lower()
                 if "version" in cell:
                     version_val = str(raw.iloc[i, j+1]).strip()
+        
+        # 对于CFM/Power表，JSON需要的表头为Document Number/Document Revision/Part Number/Role/Subrole
+        # 对于Memory/Storage/PCIe，JSON需要的表头为Document Number/Document Revision/Child Part Number/Parent Part Number/Device/Role/Subrole
         if table_name in ["CFM", "Power"]:
-            main_fields = ["Document Number", "Document Revision", "Part Number", "Role", "Subrole"]
+            # Power/CFM: 仅校验Document Number/Revision，其他字段(Part Number/Role/Subrole)强制为空且不报警
+            main_fields = ["Document Number", "Document Revision"]
+            # 对于CFM/Power来说，Part Number/Role/Subrole不需要有值
             json_main = {
                 "Document Number": info.get("Item Number", ""),
                 "Document Revision": info.get("Part Revision", ""),
-                "Part Number": extra_fields["Part Number"] if extra_fields and "Part Number" in extra_fields else "",
-                "Role": info.get("Role", ""),
-                "Subrole": info.get("Subrole", ""),
+                "Part Number": "",
+                "Role": "",
+                "Subrole": "",
             }
         else:
             main_fields = ["Document Number", "Document Revision", "Child Part Number", "Parent Part Number", "Device", "Role", "Subrole"]
-            # 提取Subrole、Child Part Number
-            subrole_header = ""
-            for i in range(min(30, len(raw))):
-                for j in range(raw.shape[1]-1):
-                    cell = str(raw.iloc[i, j]).strip().lower()
-                    if "subrole" in cell:
-                        subrole_header = str(raw.iloc[i, j+1]).strip()
-            child_part_number = ""
-            try:
-                bom_df = st.session_state.get("bom_report_level1")
-                device_kw = str(extra_fields["Device"]).strip() if extra_fields and "Device" in extra_fields else ""
-                subrole_kw = subrole_header.strip().lower() if subrole_header else ""
-                if bom_df is not None and device_kw:
-                    for idx, row in bom_df.iterrows():
-                        desc = str(row.get("Part Description", "")).lower()
-                        match_device = device_kw.lower() in desc
-                        match_subrole = True
-                        if subrole_kw:
-                            if "utility" in subrole_kw:
-                                match_subrole = "utility" in desc
-                            else:
-                                match_subrole = (subrole_kw in desc) and ("utility" not in desc)
-                        if match_device and match_subrole:
-                            child_part_number = str(row.get("Part Number", ""))
-                            break
-            except Exception:
-                child_part_number = extra_fields["Child Part Number"] if extra_fields and "Child Part Number" in extra_fields else ""
+            # 提取Subrole字段
+            # 优先使用extra_fields中的Subrole（如果已在extract_device_child_parent中提取）
+            if extra_fields and "Subrole" in extra_fields and extra_fields["Subrole"]:
+                subrole_header = extra_fields["Subrole"]
+            else:
+                # 否则尝试在表中查找
+                subrole_header = ""
+                for i in range(min(10, len(raw))):
+                    for j in range(raw.shape[1]-1):
+                        cell = str(raw.iloc[i, j]).strip().lower()
+                        if "subrole" in cell:
+                            subrole_header = str(raw.iloc[i, j+1]).strip()
+            
+            # Child Part Number直接使用传入的值
+            child_part_number = extra_fields["Child Part Number"] if extra_fields and "Child Part Number" in extra_fields else ""
+
             json_main = {
                 "Document Number": info.get("Item Number", ""),
                 "Document Revision": info.get("Part Revision", ""),
@@ -249,15 +250,14 @@ def extract_table(sheet_name, xls, uploaded_file, info, generated_on, table_name
                 "Subrole": subrole_header,
             }
 
-        # 收集warning到session_state['json_warnings']
+        # 输出所有的未能找到表头信息的warning
         if 'json_warnings' not in st.session_state:
             st.session_state['json_warnings'] = []
         for k in main_fields:
             v = str(json_main.get(k, "")).strip()
             if v == "" or v.lower() == "nan":
-                if not (table_name in ["CFM", "Power"] and k == "Part Number"):
-                    warn_msg = f"<b>Sheet:</b> <span style='color:#0072C6'>{sheet_name}</span> &nbsp; <b>Field:</b> <span style='color:#C80000'>{k}</span> &nbsp; <b>Status:</b> <span style='color:#C80000'>Missing</span>"
-                    st.session_state['json_warnings'].append(warn_msg)
+                warn_msg = f"<b>Sheet:</b> <span style='color:#0072C6'>{sheet_name}</span> &nbsp; <b>Field:</b> <span style='color:#C80000'>{k}</span> &nbsp; <b>Status:</b> <span style='color:#C80000'>Missing</span>"
+                st.session_state['json_warnings'].append(warn_msg)
 
         # 生成最终json_dict，顺序与模板一致
         json_dict = {
@@ -271,9 +271,11 @@ def extract_table(sheet_name, xls, uploaded_file, info, generated_on, table_name
     except Exception as e:
         return None, str(e)
 
+#5. 提取Device/Child Part Number/Parent Part Number的逻辑
 def extract_device_child_parent(sheet_name, xls, uploaded_file, info):
-    # 遍历sheet所有单元格，模糊查找包含'device'的单元格，取右侧的值
+    # 遍历sheet所有单元格，模糊查找包含'device'的单元格，取右侧值作为Device值
     device_val = ""
+    subrole_val = ""
     try:
         raw = pd.read_excel(uploaded_file, sheet_name=sheet_name, header=None, dtype=str)
         found = False
@@ -286,30 +288,45 @@ def extract_device_child_parent(sheet_name, xls, uploaded_file, info):
                     break
             if found:
                 break
+        
+        # 顺便提取Subrole，用于BOM查找
+        for i in range(min(10, len(raw))):
+            for j in range(raw.shape[1]-1):
+                cell = str(raw.iloc[i, j]).strip().lower()
+                if "subrole" in cell:
+                    subrole_val = str(raw.iloc[i, j+1]).strip()
     except Exception:
         device_val = ""
-    parent_part_number = info.get("Item Number", "")
+    
+    # parent_part_number直接从part properties中的item number中获取
+    parent_part_number = info.get("Item Number", "") 
+    
+    # 恢复并优化：在extract_device_child_parent中完成Child Part Number的查找
     child_part_number = ""
-    if device_val and "Bom Report" in xls.sheet_names:
-        bom_df = pd.read_excel(uploaded_file, sheet_name="Bom Report", header=0, dtype=str)
-        bom_df.columns = [str(c).strip() for c in bom_df.columns]
-        if "BOM Level" in bom_df.columns and "Part Number" in bom_df.columns and "Part Description" in bom_df.columns:
-            mask = (bom_df["BOM Level"].astype(str).str.strip() == "1")
-            filtered = bom_df[mask]
-            for _, row in filtered.iterrows():
-                desc = str(row["Part Description"]).strip()
-                if device_val and device_val in desc:
-                    child_part_number = str(row["Part Number"]).strip()
+    try:
+        bom_df = st.session_state.get("bom_report_level1")
+        device_kw = device_val.strip()
+        subrole_kw = subrole_val.strip().lower()
+        if bom_df is not None and device_kw:
+            for idx, row in bom_df.iterrows():
+                desc = str(row.get("Part Description", "")).lower()
+                match_device = device_kw.lower() in desc
+                match_subrole = True
+                if subrole_kw:
+                    # Utility的特殊逻辑
+                    if "utility" in subrole_kw:
+                        match_subrole = "utility" in desc
+                    else:
+                        match_subrole = (subrole_kw in desc) and ("utility" not in desc)
+                if match_device and match_subrole:
+                    child_part_number = str(row.get("Part Number", ""))
                     break
-    return device_val, parent_part_number, child_part_number
+    except Exception:
+        pass
+    
+    return device_val, parent_part_number, child_part_number, subrole_val
 
-def get_sheet_by_keyword(xls, keyword):
-    # 返回第一个包含keyword（不区分大小写）的sheet名
-    for name in xls.sheet_names:
-        if keyword.lower() in name.lower():
-            return name
-    return None
-
+#6. 生成JSON文件
 def download_all_button(json_files, key=None):
     import zipfile
     buf = io.BytesIO()
@@ -341,6 +358,8 @@ def download_all_button(json_files, key=None):
         key=key or "download_all_zip_button"
     )
 
+
+
 if uploaded_file:
     # 用文件名+文件大小做缓存key，保证同一文件不重复处理
     file_id = f"{uploaded_file.name}_{uploaded_file.size}"
@@ -366,7 +385,7 @@ if uploaded_file:
             for sheet_name in xls.sheet_names:
                 for kw, display_name in keywords:
                     if display_name == "Power":
-                        # 只有表名等于Power（忽略大小写）才匹配
+                        # 只有表名等于Power（忽略大小写）才匹配，Power Port Mapping除外
                         if sheet_name.strip().lower() == "power":
                             matched_sheets.append((display_name, sheet_name))
                     else:
@@ -375,7 +394,7 @@ if uploaded_file:
             # 进度条总步数：Part Properties + BOM Report + 所有matched_sheets
             total_steps = 2 + len(matched_sheets)
             processed_steps = 0
-            avg_time_per_sheet = 1.5  # 估算每步1.5秒
+            avg_time_per_sheet = 5  # 估算每步5秒
             est_total = int(total_steps * avg_time_per_sheet)
             progress_bar = st.progress(0, text="Preparing to process...")
 
@@ -446,7 +465,7 @@ if uploaded_file:
                             st.session_state["bom_report_level1"] = display_bom.copy()
                             # 只赋值，不展示，展示逻辑统一放在信息区
                         else:
-                            st.warning("BOM Report header (BOM/Substitute BOM?) not found.")
+                            st.warning("BOM Report header cannot found.")
                     except Exception as e:
                         st.warning(f"Failed to read BOM Report: {e}")
                 else:
@@ -465,9 +484,9 @@ if uploaded_file:
                     est_left = max(0, est_total - int(elapsed))
                     progress_bar.progress((processed_steps+idx)/total_steps, text=f"{current_msg} Estimated {est_left}s left.")
                     if display_name in ["Storage Mapping", "PCIe Slot Mapping", "Memory Mapping"]:
-                        device, parent, child = extract_device_child_parent(sheet, xls, uploaded_file, info)
-                        extra = {"Device": device, "Parent Part Number": parent, "Child Part Number": child}
-                        table_name = display_name if display_name != "Memory Mapping" else "Memory Mappping"
+                        device, parent, child, subrole = extract_device_child_parent(sheet, xls, uploaded_file, info)
+                        extra = {"Device": device, "Parent Part Number": parent, "Child Part Number": child, "Subrole": subrole}
+                        table_name = display_name
                     else:
                         extra = {"Part Number": ""}
                         table_name = display_name
@@ -516,10 +535,7 @@ if uploaded_file:
             st.session_state["last_file_id"] = file_id
 
 
-    # 始终展示Part Properties Info和BOM Report（避免下载后消失）
-
-
-    # ====== 信息区 ======
+    # ====== 信息展示区 ======
 
     st.markdown("""
     <div class='card-section'>
@@ -536,7 +552,7 @@ if uploaded_file:
     st.markdown("</div>", unsafe_allow_html=True)
 
 
-    # 展示所有JSON预览和下载（无论是否刚刚生成还是缓存）
+    # 展示所有JSON预览和下载
     json_files = st.session_state.get("json_files", {})
     preview_tabs = st.session_state.get("preview_tabs", [])
     json_warnings = st.session_state.get("json_warnings", [])
@@ -548,10 +564,10 @@ if uploaded_file:
         """, unsafe_allow_html=True)
         st.success("Processing Done. See below.")
         if json_warnings:
-            # 美化 warning 展示为 HTML 列表，保留原有 HTML 样式
             warning_html = "<ul style='margin-left:1em;'>" + "".join([f"<li style='margin-bottom:4px'>{w}</li>" for w in json_warnings]) + "</ul>"
             st.warning("Warnings:", icon="⚠️")
             st.markdown(warning_html, unsafe_allow_html=True)
+        
         category_map = {
             "Power": "Power",
             "CFM": "CFM",
@@ -579,6 +595,7 @@ if uploaded_file:
                 if not found:
                     st.info(f"No JSON file in this category.")
         st.markdown("\n")
+
         download_all_button(json_files, key=f"download_all_zip_button_{file_id}")
         st.markdown("</div>", unsafe_allow_html=True)
     else:
